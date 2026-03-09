@@ -1,0 +1,89 @@
+name: CI-CD-Pipeline
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - develop
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Build
+        run: npm run build || echo "No build script found"
+
+      - name: Run npm audit (dependency vulnerabilities)
+        run: npm audit --json > audit.json || true
+
+      - name: Run Snyk Open Source Scan (dependency CVEs)
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --json-file-output=snyk-deps.json
+
+      - name: Run Snyk Code Scan (SAST - file and line detail)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          npm install -g snyk
+          snyk code test --json > snyk-code.json || true
+
+      - name: Run Semgrep SAST (file and line detail)
+        continue-on-error: true
+        run: |
+          pip install semgrep --quiet
+          semgrep scan \
+            --config "p/javascript" \
+            --config "p/nodejs" \
+            --config "p/security-audit" \
+            --json \
+            --output semgrep.json \
+            . || true
+
+      - name: Install ReportLab
+        run: pip install reportlab
+
+      - name: Generate PDF Audit Report
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_DIFF: ${{ github.event_name == 'pull_request' && github.event.pull_request.diff_url || '' }}
+        run: python generate_audit_pdf.py audit.json semgrep.json snyk-code.json audit_report.pdf
+
+      - name: Upload AI Summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-summary
+          path: ai_summary.txt
+          if-no-files-found: ignore
+
+      - name: Deploy to Vercel
+        id: deploy
+        run: |
+          DEPLOYMENT_URL=$(npx vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }} | grep -o 'https://.*\.vercel\.app')
+          echo "deployment_url=$DEPLOYMENT_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload PDF Audit Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-pdf
+          path: audit_report.pdf
